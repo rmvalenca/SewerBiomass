@@ -1,0 +1,639 @@
+---
+title: "Sewer model"
+author: "Rodrigo Maia Valença"
+date: "2023-10-17"
+output: html_document
+#contact me at:
+#https://www.linkedin.com/in/rmva/
+#rmaiavalenca@gmail.com
+---
+
+```{r}
+Sys.setenv(LANG = "en")
+library(deSolve)
+library(measurements)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(openxlsx)
+library(cowplot)
+```
+
+
+..::!Functios!::..
+Gravity function
+```{r}
+GravitySewerPFR <- function(Z, state, parameters) {
+  #variables
+  S_ready <- state[1]
+  S_Hfast <- state[2]
+  S_Hslow <- state[3]
+  X_water <- state[4]
+  X_biofilm <- state[5]
+  DO <- state[6]  # OD concentration (g/m3 = mg/L)
+  
+  #parameters
+  mu_max <- parameters[1]  # Maximum specific growth rate
+  K_ready <- parameters[2]  # monod COD
+  YieldHet <- parameters[3] # Yield coefficient
+  Kdo <- parameters[4]    # monod OD
+  AreaWW <- parameters[5]  # Cross-sectional area (m^2)
+  Flow <- parameters[6]  # Flow rate (m^3/s)
+  ReaerationConstant <- parameters[7]  
+  OxygenSaturation <- parameters[8]  
+  Velocity <- parameters[9]
+  AreaBio <- parameters[10]
+  X_biomassinBiofilm <- parameters[11] 
+  Partition <- parameters[12]
+  Length <- parameters[13]
+  k_main <- parameters[14]
+  k_fast <- parameters[15]
+  Kh_fast <- parameters[16]
+  k_slow <- parameters[17]
+  Kh_slow <- parameters[18]
+  BioCoefficient <- parameters[19]
+  Temperature <- parameters[20]
+  tetaW <- parameters[21]
+  tetaB <- parameters[22]
+  tetaR <- parameters[23]
+  
+  
+  #AreaPipe <- AreaWW+AreaBio
+  AreaPipe = AreaWW+AreaBio
+  CAww = AreaWW/AreaPipe
+  F_CAww = Flow*CAww
+  CAbio = AreaBio/AreaPipe
+  F_CAbio = Flow*CAbio
+  
+  # Reaction rates
+  # biomass growth - monod
+  r_growthW <- mu_max * (S_ready / (K_ready + S_ready)) * (DO / (Kdo + DO))  * tetaW^(Temperature-20)
+  r_growthB <- mu_max * (S_ready / (K_ready + S_ready)) * (DO / (Kdo + DO))  * tetaB^(Temperature-20) *0.5
+  # biomass maintenance
+  r_mainW <- k_main * (DO / (Kdo + DO))  * tetaW^(Temperature-20)
+  r_mainB <- k_main * (DO / (Kdo + DO)) * tetaB^(Temperature-20)*0.5
+  # Hydrolysis fast
+  r_fastW <- k_fast * ((S_Hfast/X_water) / (Kh_fast + (S_Hfast/X_water)))  * tetaW^(Temperature-20)
+  r_fastB <- k_fast * ((S_Hfast/X_water) / (Kh_fast + (S_Hfast/X_water)))  * tetaB^(Temperature-20)*0.5
+  # Hydrolysis slow
+  r_slowW <- k_slow * ((S_Hslow/X_water) / (Kh_slow + (S_Hslow/X_water))) * tetaW^(Temperature-20)
+  r_slowB <- k_slow * ((S_Hslow/X_water) / (Kh_slow + (S_Hslow/X_water))) * tetaB^(Temperature-20)*0.5
+  #reaeration
+  r_O2  <- (ReaerationConstant * (OxygenSaturation - DO)) * tetaR^(Temperature-20)
+  
+  #conditional elements
+  #microbial maintenance cost
+  maintenanceCost <-   Partition * (r_mainW * (AreaWW / Flow) * X_water
+                 + r_mainB * (AreaBio / Flow) * X_biomassinBiofilm *BioCoefficient)
+  Comparison <- S_ready
+  
+  # ODE system
+  
+  #if maintenanceCost < S_ready - bacateria will grow, otherwise they will starve to death
+  if(Comparison > maintenanceCost){
+    dX_biofilmdZ <- r_growthB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio  
+  
+    dX_waterdZ <- r_growthW * (AreaWW / F_CAww) * X_water*CAww + dX_biofilmdZ
+                - r_mainW * (AreaWW / F_CAww) * X_water*CAww
+    
+    dS_readydZ <- -(1 / YieldHet)* r_growthW * (AreaWW / F_CAww) * X_water*CAww 
+                  -(1 / YieldHet)* r_growthB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient *CAbio
+                  - r_mainW * (AreaWW / F_CAww) * X_water *CAww
+                  - r_mainB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio 
+                  + r_fastW * (AreaWW / F_CAww) * X_water*CAww
+                  + r_fastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_slowW * (AreaWW / F_CAww) * X_water*CAww
+                  + r_slowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+    dS_HfastdZ <- - r_fastW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_fastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+    dS_HslowdZ <- - r_slowW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_slowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient *CAbio
+    
+    dODdZ  <- (r_O2/Velocity) 
+              -((1 - YieldHet) / YieldHet)* r_growthW * (AreaWW / F_CAww)* X_water*CAww
+              -((1 - YieldHet) / YieldHet)* r_growthB * (AreaBio / F_CAbio)* X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_mainW * (AreaWW / F_CAww) * X_water*CAww
+              - r_mainB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+  }else{
+    
+    dX_biofilmdZ <- 0 #can add random detachment here  
+    
+    dX_waterdZ <- - r_mainW * ((AreaWW+AreaBio) / Flow) * X_water
+                  
+    #if the first line is removed, the solver crashes. that is why its times zero.
+    dS_readydZ <- -(1 / YieldHet)* r_growth * (AreaWW / Flow) * 0
+                  + r_fastW * (AreaWW / F_CAww) * X_water *CAww
+                  + r_fastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_slowW * (AreaWW / F_CAww) * X_water *CAww
+                  + r_slowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio 
+    
+    dS_HfastdZ <- - r_fastW * (AreaWW / F_CAww) * X_water *CAww
+                  - r_fastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  +0.9*dX_waterdZ
+                  
+    dS_HslowdZ <- - r_slowW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_slowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio 
+                  +0.1*dX_waterdZ    
+    
+    dODdZ  <- (r_O2/Velocity) 
+              - r_mainW * (AreaWW / F_CAww) * X_water*CAww
+              - r_mainB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+  }
+  return(list(c(dS_readydZ,dS_HfastdZ,dS_HslowdZ,dX_waterdZ,dX_biofilmdZ,dODdZ)))
+}
+
+```
+Pressure function
+```{r}
+PressureSewerPFR <- function(Z, state, parameters) {
+  #variables
+  S_F <- state[1]
+  S_A <- state[2]
+  S_Hfast <- state[3]
+  S_Hslow <- state[4]
+  X_water <- state[5]
+  X_biofilm <- state[6]
+  DO <- state[7]  # OD concentration (g/m3 = mg/L)
+  
+  #parameters
+  mu_max <- parameters[1]  # Maximum specific growth rate
+  K_ready <- parameters[2]  # monod COD
+  YieldHet <- parameters[3] # Yield coefficient
+  Kdo <- parameters[4]    # monod OD
+  AreaWW <- parameters[5]  # Cross-sectional area (m^2)
+  Flow <- parameters[6]  # Flow rate (m^3/s)
+  AreaBio <- parameters[7]
+  X_biomassinBiofilm <- parameters[8] 
+  Partition <- parameters[9]
+  k_main <- parameters[10]
+  k_fast <- parameters[11]
+  Kh_fast <- parameters[12]
+  k_slow <- parameters[13]
+  Kh_slow <- parameters[14]
+  BioCoefficient <- parameters[15]
+  ACoefficient <- parameters[16]
+  muFerm_max <- parameters[17]
+  YieldFer <- parameters[18]
+  K_ferm <- parameters[19]
+  K_met <- parameters[20]
+  muMet_max <- parameters[21]
+  YieldMet <- parameters[22]
+  YieldSul <- parameters[23]
+  muSul_max <- parameters[24]
+  K_Sul <- parameters[25]
+  k_decay <- parameters[26]
+  K_AC <- parameters[27]
+  Temperature <- parameters[28]
+  tetaW <- parameters[29]
+  tetaB <- parameters[30]
+  
+  
+  #biofilm composition:
+  #50 aceto,44 archea, 6 srb
+  YieldMetSul = YieldMet*0.88+YieldSul*0.12
+  YieldBio <- YieldMetSul*0.5 + YieldFer*0.5
+  muBio <- muFerm_max*0.5+(muMet_max*0.88 + muSul_max*0.12)*0.5
+  K_bio <- K_AC*0.5+(K_met*0.88+K_Sul*0.12)*0.5
+  
+  #Flow fractioning
+  AreaPipe = AreaWW+AreaBio
+  CAww = AreaWW/AreaPipe
+  F_CAww = Flow*CAww
+  CAbio = AreaBio/AreaPipe
+  F_CAbio = Flow*CAbio
+  
+  #AreaPipe = AreaWW+AreaBio
+  #CAww = (AreaWW/AreaPipe)
+  #F_CAww = ((Flow/AreaPipe)*AreaWW)
+  #CAbio = (AreaBio/AreaPipe)
+  #F_CAbio = ((Flow/AreaPipe)*AreaBio)
+  
+  # Reaction rates
+  # biomass growth - monod
+  r_growthW <- (mu_max * ((S_F+S_A) / (K_ready + (S_F+S_A))) * (DO / (Kdo + DO)))  * tetaW^(Temperature-20)
+  #r_growthB <- (mu_max * ((S_F+S_A) / (K_ready + (S_F+S_A))) * (DO / (Kdo + DO)))  * tetaB^(Temperature-20)
+  # biomass maintenance
+  r_mainW <- (k_main * (DO / (Kdo + DO)))  * tetaW^(Temperature-20)
+  #r_mainB <- (k_main * (DO / (Kdo + DO)))  * tetaB^(Temperature-20)
+  # Hydrolysis fast
+  r_fast <- (k_fast * ((S_Hfast/X_water) / (Kh_fast + (S_Hfast/X_water))))
+  r_fastW <- (k_fast * ((S_Hfast/X_water) / (Kh_fast + (S_Hfast/X_water))))  * tetaW^(Temperature-20)
+  #r_fastB <- (k_fast * ((S_Hfast/X_water) / (Kh_fast + (S_Hfast/X_water))))  * tetaB^(Temperature-20)
+  # Hydrolysis slow
+  r_slow <- (k_slow * ((S_Hslow/X_water) / (Kh_slow + (S_Hslow/X_water))))
+  r_slowW <- (k_slow * ((S_Hslow/X_water) / (Kh_slow + (S_Hslow/X_water))))  * tetaW^(Temperature-20)
+  #r_slowB <- (k_slow * ((S_Hslow/X_water) / (Kh_slow + (S_Hslow/X_water))))  * tetaB^(Temperature-20)
+  
+  #comparison
+  #maintenanceCost <- Partition * (r_mainW * (AreaWW / Flow) * X_water
+                # + r_mainB * (AreaBio / Flow) * X_biomassinBiofilm *BioCoefficient)
+  #Comparison <- S_F
+  
+  #anaerob system
+  # fermentative biomass growth - monod
+  r_ferm <- (muFerm_max * (S_F / (K_ferm + S_F)))  * tetaW^(Temperature-20)
+  # methanogenic/sulfidogenic biomass growth - monod - marcia
+  r_Bio <- (muBio* (S_A / (K_bio + S_A)))   * tetaB^(Temperature-20)
+  # biomass decay Aerob
+  r_decayAerob <- (k_main)  * tetaW^(Temperature-20)
+  # biomass decay MetSul
+  r_decayBio <- (k_decay)  * tetaB^(Temperature-20)
+  r_decayBioW <- (k_decay)  * tetaW^(Temperature-20)
+  # Anerobic Hydrolysis fast
+  r_AfastW <- (r_fast*ACoefficient)   * tetaW^(Temperature-20)
+  r_AfastB <- (r_fast*ACoefficient)   * tetaB^(Temperature-20)
+  # Anerobic Hydrolysis slow
+  r_AslowW <- (r_slow*ACoefficient)  * tetaW^(Temperature-20)
+  r_AslowB <- (r_slow*ACoefficient)  * tetaB^(Temperature-20)
+  # Heterotopic bacteria (acetogenesis) growth - monod
+  #r_AC <- muFerm_max * (S_A / (K_AC + S_A))#supplementary paper reference
+  
+  #comparison2
+  #ACost <- Partition*(1 / YieldFer)* r_ferm * ((AreaWW / Flow) * X_water+(AreaBio / Flow) * X_biomassinBiofilm * BioCoefficient)
+  
+  # ODE system
+  if(DO>0.01){
+    
+    dX_biofilmdZ <- #r_growth * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                    r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+  
+    dX_waterdZ <- r_growthW * (AreaWW / F_CAww) * X_water*CAww + dX_biofilmdZ
+    
+    dS_FdZ <- - (1 / YieldHet)* r_growthW * (AreaWW / F_CAww) * X_water*CAww 
+              #- (1 / YieldHet)* r_growth * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio 
+              - r_mainW * (AreaWW / F_CAww) * X_water*CAww 
+              #- r_main * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio 
+              + r_fastW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              + r_slowW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+    dS_AdZ <- - (1 / YieldBio)* r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_decayBio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio#maintenance biofilm
+    
+    dS_HfastdZ <- - r_fastW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+    dS_HslowdZ <- - r_slowW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient *CAbio
+    
+    dODdZ  <- -((1 - YieldHet) / YieldHet)* r_growthW * (AreaWW / F_CAww)* X_water*CAww
+              #-((1 - YieldHet) / YieldHet)* r_growth * (AreaBio / F_CAbio)* X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_mainW * (AreaWW / F_CAww) * X_water*CAww
+              #- r_main * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient *CAbio
+  
+  }else{if(S_F>(Partition * (r_decayAerob * (AreaWW / Flow) * X_water))){
+   #anaerobiose 
+    dX_biofilmdZ <- r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                    
+                    
+    dX_waterdZ <- r_ferm * (AreaWW / F_CAww) * X_water*CAww + dX_biofilmdZ
+                  - r_decayAerob * (AreaWW / F_CAww) * X_water*CAww
+    
+    dS_FdZ <- - (1 / YieldFer)* r_ferm * (AreaWW / F_CAww) * X_water*CAww
+              + r_AfastW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AslowW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              + r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_decayBioW * (AreaWW / F_CAww) * X_water*CAww#maintenance fermenters-Water
+              
+    dS_AdZ <- (1 / YieldFer)* r_ferm * (AreaWW / F_CAww) * X_water*CAww 
+              - (1 / YieldBio)* r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_decayBio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio#maintenance biofilm
+              
+    dS_HfastdZ <- - r_AfastW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_decayAerob * (AreaWW / F_CAww) * X_water*0.9*CAww  
+           
+    dS_HslowdZ <- - r_AslowW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_decayAerob * (AreaWW / F_CAww) * X_water*0.1*CAww
+                  
+    dODdZ  <- 0
+    
+  }else{#stop fermentation, stop aerob decay, now fermenters decay
+    
+    dX_biofilmdZ <- r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+    
+    dX_waterdZ <- + dX_biofilmdZ
+                  - r_decayBioW * (AreaWW / F_CAww) * X_water*CAww#fermenters starving-water
+    
+    dS_FdZ <- + r_AfastW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AslowW * (AreaWW / F_CAww) * X_water*CAww
+              + r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              + r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              
+             
+    dS_AdZ <- - (1 / YieldBio)* r_Bio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+              - r_decayBio * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio#maintenance biofilm
+              
+    
+    dS_HfastdZ <- - r_AfastW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AfastB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_decayBioW * (AreaWW / F_CAww) * X_water*0.9*CAww  
+          
+    dS_HslowdZ <- - r_AslowW * (AreaWW / F_CAww) * X_water*CAww
+                  - r_AslowB * (AreaBio / F_CAbio) * X_biomassinBiofilm * BioCoefficient*CAbio
+                  + r_decayBioW * (AreaWW / F_CAww) * X_water*0.1*CAww
+                  
+    dODdZ  <- 0
+  }
+      
+  }
+  
+  
+  return(list(c(dS_FdZ,dS_AdZ,dS_HfastdZ,dS_HslowdZ,dX_waterdZ,dX_biofilmdZ,dODdZ)))
+}
+
+```
+
+Kinectic parameters
+```{r}
+#Kinectic parameters
+mu_max = 3.25/conv_unit(1, "day", "s") # maximum growth rate (s-1)
+K_Sready = 1 # Monod constant readly biodegrable cod (g/m3 = mg/L)
+YieldHet = 0.55 # biomass yield constant (-)
+Kdo = 0.5 # Monod constant OD (g/m3 = mg/L)
+k_main = 1/conv_unit(1, "day", "s") # Maintenance rate (s-1)
+k_decay = 0.000833/conv_unit(1, "hr", "s") # for metsul(s-1)
+k_fast = 4/conv_unit(1, "day", "s") # fast hydrolysis rate constant (s-1)
+Kh_fast = 0.5 # fast hydrolysis saturation constant (-)
+k_slow = 1/conv_unit(1, "day", "s") # slow hydrolysis rate constant (s-1)
+Kh_slow = 0.2 # slow hydrolysis saturation constant (-)
+ACoefficient = 0.2 #hydrolisis reduction factor
+#muFerm_max = 1.3/conv_unit(1, "day", "s") # maximum growth rate (s-1)
+muFerm_max = 0.125/conv_unit(1, "hr", "s") # maximum growth rate (s-1)
+YieldFer = 0.15 #COD/COD
+K_ferm = 20#gCOD/m3
+#muMet_max = 0.139/conv_unit(1, "day", "s") # maximum growth rate (s-1)
+muMet_max = 0.01/conv_unit(1, "hr", "s") # maximum growth rate (s-1)
+K_met = 409 #gCOD/m3
+YieldMet = 0.05 #COD/COD
+#muSul_max = 0.33/conv_unit(1, "day", "s") #acetate maximum growth rate (s-1)
+muSul_max = 0.023/conv_unit(1, "hr", "s") #acetate maximum growth rate (s-1)
+K_Sul = 4.1 #gCOD/m3
+YieldSul = 0.0568 #COD/COD
+K_Ac <- 500 #gCOD/m3 suplementar paper
+BioCoefficient = 0.15 # accounting for diffusion limitations(0.15-0.6) -  sensitivity
+
+Temperature = 10 #Celsius
+tetaW <- 1.07
+tetaB <- 1.05
+tetaR <- 1.024
+
+Partition = 1 # (m)
+Z <- seq(0, 1201, by = Partition) #amount of length subdivisions
+# Initial Conditions
+TotalCOD <- 600  # Initial COD (g/m3 = mg/L)
+#COD fractions
+S_ready0<- 0.06*TotalCOD # Initial COD (g/m3 = mg/L) 0.06
+S_Hfast0<- 0.15*TotalCOD  # Initial COD (g/m3 = mg/L) 0.15
+S_Hslow0<- 0.74*TotalCOD   # Initial COD (g/m3 = mg/L) 0.74
+X_water0<- 0.05*TotalCOD  # Initial COD (g/m3 = mg/L) 0.05
+
+DO0  <- 4.5 # (g O2/m3 = mg O2/L)
+OxygenSaturation = 4.5 # (g O2/m3 = mg O2/L)
+
+X_biofilm0 <- 0
+#BiofilmBiomassDensity = 10 # (gCOD/m2) paper asbjorn
+X_biomassinBiofilmG = 10000 # (gCOD/m3)
+X_biomassinBiofilmP = X_biomassinBiofilmG/VelocityG # (gCOD/m3)
+
+BioThicknessG = 1 # (mm)
+BioThicknessP = 0.6 # (mm)
+
+
+```
+
+..::!Gravity!::..
+Physical parameters - gravity
+```{r}
+
+DiameterG = 250
+FillingCoeficient = 0.1
+FlowDepth = DiameterG*FillingCoeficient # (mm)
+Angle = acos(1-(2*FlowDepth/DiameterG)) # (rad)
+AreaWg = conv_unit(((DiameterG^2)/8)*(2*Angle-sin(2*Angle)), "mm2", "m2") # (m2)
+HydraulicRg = AreaWg/(conv_unit(DiameterG, "mm", "m")*Angle) # (m)
+PerimeterWg = conv_unit(DiameterG, "mm", "m") * Angle # (m)
+Chord = (((conv_unit(DiameterG, "mm", "m")/2))*(2-2*cos((2*pi-2*Angle)))^0.5) # (m)
+HydraulicDepthG = AreaWg/Chord # (m)
+AreaBioG = conv_unit(BioThicknessG, "mm", "m")*PerimeterWg
+AreabioPercG<-(AreaBioG/AreaWg)
+```
+
+Hydraulics - Manning equation
+```{r}
+#Hydraulics - Manning equation
+ManningN = 0.013 # concrete pipes
+VelocityG = 0.6
+FlowG = VelocityG*AreaWg #m3/s
+Slope = (FlowG*(ManningN/AreaWg)/(HydraulicRg^(2/3)))^2 
+#WaterConsumption = 100 # (l/person*day)
+#PE = (conv_unit(FlowG, "m3_per_sec", "l_per_hr")/24)/(WaterConsumption*0.8) # PE
+FroudeN = VelocityG*((9.81*HydraulicDepthG)^(-0.5)) # Froude number
+ReaerationConstant <- (0.86*(1+0.2*(FroudeN)^2)*(Slope*VelocityG)^(3/8)*HydraulicDepthG^-1)/3600 # (s-1)
+
+```
+
+..::!Pressure!::..
+Physical parameters + hydraulics pressure
+```{r}
+# Physical parameters
+#DiameterP = (FlowDepth/DiameterG)*3*DiameterG # (mm)
+#DiameterP = DiameterG*0.56 # (mm) ESSE AQUI
+DiameterP = 140
+AreaWp = conv_unit((pi*DiameterP^2)/4, "mm2", "m2") # (m2)
+PerimeterWp = conv_unit(pi*DiameterP, "mm", "m") # (m)
+#Hydraulics
+#FlowP = FlowG
+#VelocityP = FlowP/AreaWp # (m/s)
+VelocityP = 0.09957402
+FlowP = AreaWp*VelocityP
+AreaBioP = conv_unit(BioThicknessP, "mm", "m")*PerimeterWp
+AreabioPercP<-(AreaBioP/AreaWp)
+```
+
+
+..::!Run!::..
+Run Pressure pipe
+```{r}
+#Biofilm
+
+AreaBioP = conv_unit(BioThicknessP, "mm", "m")*PerimeterWp
+AreaWWp = AreaWp - AreaBioP
+
+InitialVariables <- c(S_ready0*0.4,S_ready0*0.6,S_Hfast0,S_Hslow0,X_water0,X_biofilm0,0)
+
+Parameters <- c(mu_max, K_Sready, YieldHet, Kdo, AreaWWp,FlowP,
+                AreaBioP,X_biomassinBiofilmP,Partition, k_main,k_fast,
+                Kh_fast,k_slow,Kh_slow,BioCoefficient,ACoefficient,
+                muFerm_max,YieldFer,K_ferm,K_met,muMet_max,YieldMet,
+                YieldSul,muSul_max,K_Sul,k_decay,K_Ac, Temperature, tetaW,tetaB)
+
+
+#Solution
+Solution <- ode(y = InitialVariables, times = Z, func = PressureSewerPFR, parms = Parameters)#,maxsteps = 10000)
+SolutionPressure <- as.data.frame(Solution)
+names(SolutionPressure) = c("Length","Fer","S","Hfast","Hslow","X_water","X_biofilm","DO")
+SolutionPressure$TotalCOD <- SolutionPressure$Fer+SolutionPressure$S+SolutionPressure$Hfast+SolutionPressure$Hslow+SolutionPressure$X_water
+names(SolutionPressure) = c("Length(m)","S_F(g/m3)","S_A(g/m3)","S_Hfast(g/m3)","S_Hslow(g/m3)","X_water(g/m3)","X_biofilm(g/m3)","DO(g/m3)","TotalCOD(g/m3)")
+
+#removal efficiency
+SolutionPressure$`CODremoval(%)` <- (1 - (SolutionPressure$TotalCOD/TotalCOD))*100
+
+#Biofilm fraction
+SolutionPressure$`Biof(%)` <-  (SolutionPressure$`X_biofilm(g/m3)`/SolutionPressure$`X_water(g/m3)`)*100
+
+SolutionPressure$`HRT(min)` <- (SolutionPressure$`Length(m)`/VelocityP)/60
+
+SolutionPressure <- SolutionPressure[, c("Length(m)","HRT(min)","S_F(g/m3)","S_A(g/m3)","S_Hfast(g/m3)","S_Hslow(g/m3)","X_water(g/m3)","X_biofilm(g/m3)","DO(g/m3)","TotalCOD(g/m3)","CODremoval(%)","Biof(%)")]
+
+
+SolutionPressure <- SolutionPressure %>%  mutate(`bioIncrement(g/m3)` = (`X_biofilm(g/m3)` - lag(`X_biofilm(g/m3)`, default = X_biofilm0)))
+
+
+#plots
+ggplot(SolutionPressure, aes(x = `Length(m)`)) +
+  geom_line(aes(y = `S_F(g/m3)`, color = "sugar"), linewidth = 1) +
+  geom_line(aes(y = `S_A(g/m3)`, color = "acid"), linewidth = 1) +
+  geom_line(aes(y = `S_Hfast(g/m3)`, color = "FastHydrolysedSubstrate"), linewidth = 1) +
+  geom_line(aes(y = `S_Hslow(g/m3)`, color = "SlowHydrolysedSubstrate"), linewidth = 1) +
+  geom_line(aes(y = `X_water(g/m3)`, color = "Biomass"), linewidth = 1) +
+  geom_line(aes(y = `TotalCOD(g/m3)`, color = "TotalCOD"), linewidth = 1) +
+  labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+ggplot(SolutionPressure, aes(x = `Length(m)`)) +
+  geom_line(aes(y = `DO(g/m3)`, color = "DO"), linewidth = 1)
+  labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+```
+Run Gravity pipe
+```{r}
+
+AreaBioG = conv_unit(BioThicknessG, "mm", "m")*PerimeterWg
+AreaWWg = AreaWg - AreaBioG
+#X_biofilm0 <- 0
+
+
+InitialVariables <- c(S_ready0,S_Hfast0,S_Hslow0,X_water0,X_biofilm0,DO0)
+
+Parameters <- c(mu_max, K_Sready, YieldHet, Kdo, AreaWWg,FlowG,ReaerationConstant,
+                OxygenSaturation,VelocityG,AreaBioG, X_biomassinBiofilmG, 
+                Partition, Length, k_main,k_fast,
+                Kh_fast,k_slow,Kh_slow,BioCoefficient, Temperature, tetaW,tetaB,tetaR)
+
+#Solution
+Solution <- ode(y = InitialVariables, times = Z, func = GravitySewerPFR, parms = Parameters)
+SolutionGravity <- as.data.frame(Solution)
+names(SolutionGravity) = c("Length","S_ready","S_Hfast","S_Hslow","X_water","X_biofilm","DO")
+SolutionGravity$TotalCOD <- SolutionGravity$S_ready+SolutionGravity$S_Hfast+SolutionGravity$S_Hslow+SolutionGravity$X_water
+names(SolutionGravity) = c("Length(m)","S_ready(g/m3)","S_Hfast(g/m3)","S_Hslow(g/m3)","X_water(g/m3)","X_biofilm(g/m3)","DO(g/m3)","TotalCOD(g/m3)")
+#removal efficiency
+SolutionGravity$`CODremoval(%)` <- (1 - (SolutionGravity$TotalCOD/TotalCOD))*100
+#Biofilm fraction
+SolutionGravity$`Biof(%)` <-  (SolutionGravity$`X_biofilm(g/m3)`/SolutionGravity$`X_water(g/m3)`)*100
+
+SolutionGravity$`HRT(min)` <- (SolutionGravity$`Length(m)`/VelocityG)/60
+
+SolutionGravity <- SolutionGravity[, c("Length(m)","HRT(min)","S_ready(g/m3)","S_Hfast(g/m3)","S_Hslow(g/m3)","X_water(g/m3)","X_biofilm(g/m3)","DO(g/m3)","TotalCOD(g/m3)","CODremoval(%)","Biof(%)")]
+
+SolutionGravity <- SolutionGravity %>%  mutate(`bioIncrement(g/m3)` = (`X_biofilm(g/m3)` - lag(`X_biofilm(g/m3)`, default = X_biofilm0)))
+
+
+
+#plots
+ggplot(SolutionGravity, aes(x = `Length(m)`)) +
+  geom_line(aes(y = `S_ready(g/m3)`, color = "BiodegradableSubstrate"), linewidth = 1) +
+  geom_line(aes(y = `S_Hfast(g/m3)`, color = "FastHydrolysedSubstrate"), linewidth = 1) +
+  geom_line(aes(y = `S_Hslow(g/m3)`, color = "SlowHydrolysedSubstrate"), linewidth = 1) +
+  geom_line(aes(y = `X_water(g/m3)`, color = "Biomass"), linewidth = 1) +
+  geom_line(aes(y = `TotalCOD(g/m3)`, color = "TotalCOD"), linewidth = 1) +
+  labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+ggplot(SolutionGravity, aes(x = `Length(m)`)) +
+  geom_line(aes(y = `DO(g/m3)`, color = "DO"), linewidth = 1)
+  labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+  
+  
+#biofilm plot  
+ # ggplot(SolutionGravity, aes(x = `Length(m)`)) +
+  #geom_line(aes(y = `X_biofilm(g/m3)`, color = "X_biofilm(g/m3)"), linewidth = 1)
+ # labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  #theme_minimal() +
+ # theme(legend.title = element_blank())
+  
+#biofilm plot  
+ # ggplot(SolutionPressure, aes(x = `Length(m)`)) +
+ # geom_line(aes(y = `X_biofilm(g/m3)`, color = "X_biofilm(g/m3)"), linewidth = 1)
+ # labs(x = "Length (m)", y = "Concentration (g/m3)") +
+ # theme_minimal() +
+ # theme(legend.title = element_blank())
+  
+#water plot  
+ # ggplot(SolutionGravity, aes(x = `Length(m)`)) +
+ # geom_line(aes(y = `X_water(g/m3)`, color = "DO"), linewidth = 1)
+ # labs(x = "Length (m)", y = "Concentration (g/m3)") +
+ # theme_minimal() +
+ # theme(legend.title = element_blank())
+#ggplot(SolutionPressure, aes(x = `Length(m)`)) +
+  #geom_line(aes(y = `X_water(g/m3)`, color = "DO"), linewidth = 1)
+  #labs(x = "Length (m)", y = "Concentration (g/m3)") +
+  #theme_minimal() +
+  #theme(legend.title = element_blank())
+```
+
+
+..::!Stats!::..
+```{r}
+
+#teste2=teste
+
+teste = SolutionGravity
+
+teste$`Flow(m3/s)` <- FlowG
+#System biomass
+teste$`SystemBiofilm(g/m)` <- (((BioThicknessG/1000)*(teste$`Length(m)`*PerimeterWg))*X_biomassinBiofilmG)/teste$`Length(m)`
+teste$`SystemBiofilm2(g/m2)` <- (((BioThicknessG/1000)*(teste$`Length(m)`*PerimeterWg))*X_biomassinBiofilmG)/(teste$`Length(m)`*PerimeterWg)
+#KeyNumbers
+teste$`BPL(g/mDay)` <- ((teste$`X_water(g/m3)`*teste$`Flow(m3/s)`)/teste$`Length(m)`)*24*60*60
+teste$`BPA(g/m2day)` <- ((teste$`X_water(g/m3)`*teste$`Flow(m3/s)`)/(teste$`Length(m)`*PerimeterWg))*24*60*60
+#teste
+teste$`BPArea(kg/m3day)` <- ((teste$`X_water(g/m3)`*VelocityG)*(1- AreabioPercG))*24*60*60/1000000
+teste$`DPL(g/mDay)` <- ((teste$`X_biofilm(g/m3)`*teste$`Flow(m3/s)`)/teste$`Length(m)`)*24*60*60
+teste$`DPA(g/m2day)` <- ((teste$`X_biofilm(g/m3)`*teste$`Flow(m3/s)`)/(teste$`Length(m)`*PerimeterWg))*24*60*60
+
+GravityCOD1200<- teste
+
+teste = SolutionPressure
+
+teste$`Flow(m3/s)` <- FlowP
+#System biomass
+teste$`SystemBiofilm(g/m)` <- (((BioThicknessP/1000)*(teste$`Length(m)`*PerimeterWp))*X_biomassinBiofilmP)/teste$`Length(m)`
+teste$`SystemBiofilm2(g/m2)` <- (((BioThicknessP/1000)*(teste$`Length(m)`*PerimeterWp))*X_biomassinBiofilmP)/(teste$`Length(m)`*PerimeterWp)
+#KeyNumbers
+teste$`BPL(g/mDay)` <- ((teste$`X_water(g/m3)`*teste$`Flow(m3/s)`)/teste$`Length(m)`)*24*60*60
+teste$`BPA(g/m2day)` <- ((teste$`X_water(g/m3)`*teste$`Flow(m3/s)`)/(teste$`Length(m)`*PerimeterWp))*24*60*60
+#teste
+teste$`BPArea(kg/m3day)` <- ((teste$`X_water(g/m3)`*VelocityP)*(1- AreabioPercP))*24*60*60/1000000
+teste$`DPL(g/mDay)` <- ((teste$`X_biofilm(g/m3)`*teste$`Flow(m3/s)`)/teste$`Length(m)`)*24*60*60
+teste$`DPA(g/m2day)` <- ((teste$`X_biofilm(g/m3)`*teste$`Flow(m3/s)`)/(teste$`Length(m)`*PerimeterWp))*24*60*60
+
+PressureCOD1200 <- teste
+
+
+
+```
+
